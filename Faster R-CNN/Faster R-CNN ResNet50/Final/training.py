@@ -1,0 +1,422 @@
+import os
+import torch
+import torchvision
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.ops import box_iou
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+from pathlib import Path
+import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+# ==========================================
+# DATASET DE TENSORES PRE-GUARDADOS (.PT)
+# ==========================================
+class PreloadedPTDataset(Dataset):
+    def __init__(self, img_pt_dir, lbl_dir, img_size=800):
+        self.img_pt_dir = Path(img_pt_dir)
+        self.lbl_dir = Path(lbl_dir)
+        self.img_size = img_size
+        self.img_files = sorted(f for f in self.img_pt_dir.iterdir() if f.suffix == ".pt")
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, idx):
+        img_path = self.img_files[idx]
+        img = torch.load(img_path)
+        lbl_path = self.lbl_dir / f"{img_path.stem}.txt"
+        boxes, labels = self.load_yolo_labels(lbl_path)
+        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx], dtype=torch.int64)}
+        return img, target
+
+    def load_yolo_labels(self, path):
+        boxes, labels = [], []
+        if not path.exists():
+            return torch.zeros((0,4)), torch.zeros((0,), dtype=torch.int64)
+        with open(path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts)!=5:
+                    continue
+                cls = int(float(parts[0]))
+                x, y, bw, bh = map(float, parts[1:])
+                x1 = (x-bw/2)*self.img_size
+                y1 = (y-bh/2)*self.img_size
+                x2 = (x+bw/2)*self.img_size
+                y2 = (y+bh/2)*self.img_size
+                if x2>x1 and y2>y1:
+                    boxes.append([x1,y1,x2,y2])
+                    labels.append(cls+1)
+        if len(boxes)==0:
+            return torch.zeros((0,4)), torch.zeros((0,), dtype=torch.int64)
+        return torch.tensor(boxes,dtype=torch.float32), torch.tensor(labels,dtype=torch.int64)
+
+# ==========================================
+# COLLATE
+# ==========================================
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+# ==========================================
+# MODELO
+# ==========================================
+def get_model(num_classes):
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features,num_classes)
+    return model
+
+# ==========================================
+# CONGELAR PARCIAL BACKBONE
+# ==========================================
+def freeze_backbone_partially(model):
+    backbone = model.backbone.body
+    for name,param in backbone.named_parameters():
+        if name.startswith("conv1") or name.startswith("bn1") or name.startswith("layer1") or name.startswith("layer2"):
+            param.requires_grad=False
+
+def validate_model(model, val_loader, device, num_classes_plot):
+    """
+    Validación vectorizada optimizada del modelo Faster-RCNN.
+    Devuelve métricas por clase, métricas globales y matriz de confusión.
+    """
+
+    model.eval()
+    cm = torch.zeros((num_classes_plot, num_classes_plot), dtype=torch.int32, device=device)
+
+    # Diccionarios para almacenar predicciones y GT por clase (como tensores)
+    preds_per_class = {cls: [] for cls in range(1, num_classes_plot + 1)}
+    gts_per_class   = {cls: [] for cls in range(1, num_classes_plot + 1)}
+
+    with torch.no_grad():
+        for images, targets in tqdm(val_loader, desc="Validating"):
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            outputs = model(images)
+
+            for t, pred in zip(targets, outputs):
+                gt_boxes = t["boxes"]            # [num_gt, 4]
+                gt_labels = t["labels"]          # [num_gt]
+                pred_boxes = pred["boxes"]       # [num_pred, 4]
+                pred_labels = pred["labels"]     # [num_pred]
+                pred_scores = pred["scores"]     # [num_pred]
+
+                if len(gt_labels) > 0 and len(pred_labels) > 0:
+                    ious_matrix = box_iou(pred_boxes, gt_boxes)  # [num_pred, num_gt]
+                    matched_gt = torch.zeros(len(gt_labels), dtype=torch.bool, device=device)
+
+                    # Matching 1-a-1 y construcción de matriz de confusión
+                    for i in range(len(pred_boxes)):
+                        iou_max, idx = ious_matrix[i].max(0)
+                        pred_cls = pred_labels[i].item()
+                        if iou_max >= 0.5 and not matched_gt[idx]:
+                            true_cls = gt_labels[idx].item()
+                            cm[true_cls - 1, pred_cls - 1] += 1
+                            matched_gt[idx] = True
+                        else:
+                            # FP: predicción incorrecta (marca en fila de GT = pred_cls)
+                            cm[pred_cls - 1, pred_cls - 1] += 1
+                elif len(pred_boxes) > 0:
+                    # Predicciones sin GT: todas FP
+                    for i, pred_cls in enumerate(pred_labels):
+                        cm[pred_cls.item() - 1, pred_cls.item() - 1] += 1
+
+                # Guardar predicciones y GT por clase como tensores (no listas gigantes)
+                for cls in range(1, num_classes_plot + 1):
+                    gts_cls = gt_boxes[gt_labels == cls]
+                    preds_cls = pred_boxes[pred_labels == cls]
+                    scores_cls = pred_scores[pred_labels == cls]
+                    if len(gts_cls) > 0:
+                        gts_per_class[cls].append(gts_cls)
+                    if len(preds_cls) > 0:
+                        preds_per_class[cls].append((scores_cls, preds_cls))
+
+    # -------------------------------------------------------
+    # Cálculo de métricas por clase
+    # -------------------------------------------------------
+    cls_metrics = {}
+    for cls in range(1, num_classes_plot + 1):
+        if len(preds_per_class[cls]) == 0 and len(gts_per_class[cls]) == 0:
+            cls_metrics[cls] = {"precision":0.0,"recall":0.0,"mAP50":0.0,"mAP95":0.0}
+            continue
+
+        # Concatenar todos los tensores de predicciones y GT
+        pred_scores_all = torch.cat([s for s, _ in preds_per_class[cls]], dim=0) if preds_per_class[cls] else torch.tensor([], device=device)
+        pred_boxes_all  = torch.cat([b for _, b in preds_per_class[cls]], dim=0) if preds_per_class[cls] else torch.empty((0,4), device=device)
+        gt_boxes_all    = torch.cat(gts_per_class[cls], dim=0) if gts_per_class[cls] else torch.empty((0,4), device=device)
+
+        # Función para calcular AP vectorizado
+        def compute_ap(pred_boxes, pred_scores, gt_boxes, iou_thr=0.5):
+            if len(pred_boxes) == 0 or len(gt_boxes) == 0:
+                return 0.0, 0.0, 0.0
+
+            # Ordenar por score
+            scores_sorted, idx_sort = pred_scores.sort(descending=True)
+            boxes_sorted = pred_boxes[idx_sort]
+
+            # Calcular IoU matrix
+            ious = box_iou(boxes_sorted, gt_boxes)  # [num_pred, num_gt]
+            matched_gt = torch.zeros(len(gt_boxes), dtype=torch.bool, device=device)
+
+            TP = torch.zeros(len(boxes_sorted), device=device)
+            FP = torch.zeros(len(boxes_sorted), device=device)
+
+            for i in range(len(boxes_sorted)):
+                iou_max, idx = ious[i].max(0)
+                if iou_max >= iou_thr and not matched_gt[idx]:
+                    TP[i] = 1
+                    matched_gt[idx] = True
+                else:
+                    FP[i] = 1
+
+            tp_cum = torch.cumsum(TP, dim=0)
+            fp_cum = torch.cumsum(FP, dim=0)
+            recalls = tp_cum / (len(gt_boxes) + 1e-8)
+            precisions = tp_cum / (tp_cum + fp_cum + 1e-8)
+
+            # AP usando integración trapecio
+            ap = torch.trapz(precisions.cpu(), recalls.cpu()).item()
+            recall_final = recalls[-1].item() if len(recalls) > 0 else 0.0
+            precision_final = precisions[-1].item() if len(precisions) > 0 else 0.0
+            return ap, recall_final, precision_final
+
+        # AP50
+        mAP50, recall50, precision50 = compute_ap(pred_boxes_all, pred_scores_all, gt_boxes_all, 0.5)
+        # AP95: promedio de thresholds 0.5:0.05:0.95
+        ap_sum = 0.0
+        for thr in torch.arange(0.5, 1.0, 0.05):
+            ap, _, _ = compute_ap(pred_boxes_all, pred_scores_all, gt_boxes_all, thr.item())
+            ap_sum += ap
+        mAP95 = ap_sum / 10
+
+        cls_metrics[cls] = {
+            "precision": precision50,
+            "recall": recall50,
+            "mAP50": mAP50,
+            "mAP95": mAP95
+        }
+
+    # -------------------------------------------------------
+    # Métricas globales
+    # -------------------------------------------------------
+    global_metrics = {metric: sum(cls_metrics[c][metric] for c in cls_metrics)/num_classes_plot 
+                      for metric in ["precision","recall","mAP50","mAP95"]}
+
+    return cls_metrics, global_metrics, cm
+
+
+
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+
+    TRAIN_IMG = r"E:\Escuela\Redes Neuronales\Angelica\Data\train\images_pt"
+    TRAIN_LBL = r"E:\Escuela\Redes Neuronales\Angelica\Data\train\labels"
+    VAL_IMG   = r"E:\Escuela\Redes Neuronales\Angelica\Data\valid\images_pt"
+    VAL_LBL   = r"E:\Escuela\Redes Neuronales\Angelica\Data\valid\labels"
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_ds = PreloadedPTDataset(TRAIN_IMG, TRAIN_LBL)
+    val_ds   = PreloadedPTDataset(VAL_IMG, VAL_LBL)
+    train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds, batch_size=2, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    output_dir = Path(r"E:\Escuela\Redes Neuronales\Angelica\Resultados")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = get_model(num_classes=5)
+    freeze_backbone_partially(model)
+    model.to(device)
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.005, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
+    scaler = GradScaler()
+
+    num_epochs = 25
+    num_classes_plot = 4
+    train_losses = []
+
+    # Checkpoint resume
+    start_epoch = 0
+    metrics_history_per_class = {cls:{metric:[] for metric in ["precision","recall","mAP50","mAP95"]} for cls in range(1,num_classes_plot+1)}
+    metrics_history_global = {metric:[] for metric in ["precision","recall","mAP50","mAP95"]}
+
+    checkpoint_files = glob.glob("checkpoint_epoch_*.pth")
+    if checkpoint_files:
+        checkpoint_files.sort(key=lambda x:int(x.split('_')[-1].split('.')[0]))
+        latest_checkpoint = checkpoint_files[-1]
+        checkpoint = torch.load(latest_checkpoint,map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch']+1
+        train_losses = checkpoint.get('train_losses',[])
+        metrics_history_per_class = checkpoint.get('metrics_history_per_class',metrics_history_per_class)
+        metrics_history_global = checkpoint.get('metrics_history_global',metrics_history_global)
+        print(f"Resumed from epoch {start_epoch}")
+
+    # =========================
+    # LOOP ENTRENAMIENTO + VALIDACIÓN
+    # ==========================
+    for epoch in range(start_epoch,num_epochs):
+        # -------------------------
+        # TRAINING
+        # -------------------------
+        model.train()
+        total_train_loss = 0.0
+        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]") as pbar:
+            for images, targets in pbar:
+                images = [i.to(device) for i in images]
+                targets = [{k:v.to(device) for k,v in t.items()} for t in targets]
+
+                optimizer.zero_grad()
+                with autocast():
+                    loss_dict = model(images, targets)
+                    loss = sum(v for v in loss_dict.values())
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total_train_loss += loss.item()
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        train_losses.append(total_train_loss/len(train_loader))
+        torch.cuda.synchronize()
+
+        # -------------------------
+        # VALIDACIÓN
+        # -------------------------
+        cls_metrics, global_metrics, cm = validate_model(model, val_loader, device, num_classes_plot)
+
+        # Guardar métricas
+        for cls in range(1,num_classes_plot+1):
+            for metric in ["precision","recall","mAP50","mAP95"]:
+                metrics_history_per_class[cls][metric].append(cls_metrics[cls][metric])
+        for metric in ["precision","recall","mAP50","mAP95"]:
+            metrics_history_global[metric].append(global_metrics[metric])
+
+        # -------------------------
+        # CHECKPOINT
+        # -------------------------
+        scheduler.step()
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'train_losses': train_losses,
+            'metrics_history_per_class': metrics_history_per_class,
+            'metrics_history_global': metrics_history_global
+        }
+        torch.save(checkpoint, f"checkpoint_epoch_{epoch+1}.pth")
+        print(f"Epoch {epoch+1} | Train Loss: {train_losses[-1]:.4f} | mAP50 Global: {global_metrics['mAP50']:.4f}")
+
+
+# =========================
+# GRAFICOS Y TABLAS FINALES
+# ==========================
+
+# -------------------------
+# LOSS POR ÉPOCA
+# -------------------------
+plt.figure(figsize=(12,6), dpi=150)
+plt.plot(train_losses, label="Train Loss", marker='o')
+plt.title("Evolución del Train Loss por Época", fontsize=16)
+plt.xlabel("Época", fontsize=14)
+plt.ylabel("Loss", fontsize=14)
+plt.legend(fontsize=12)
+plt.grid(True)
+plt.savefig(output_dir / "train_loss_per_epoch.png")
+plt.close()
+
+# -------------------------
+# METRICAS POR CLASE
+# -------------------------
+for metric in ["precision","recall","mAP50","mAP95"]:
+    plt.figure(figsize=(12,6), dpi=150)
+    for cls in range(1,num_classes_plot+1):
+        plt.plot(metrics_history_per_class[cls][metric], label=f"Clase {cls}", marker='o')
+    plt.title(f"{metric} por Clase a lo largo de las Épocas", fontsize=16)
+    plt.xlabel("Época", fontsize=14)
+    plt.ylabel(metric, fontsize=14)
+    plt.ylim(0,1)
+    plt.legend(fontsize=12)
+    plt.grid(True)
+    plt.savefig(output_dir / f"{metric}_per_class_progress.png")
+    plt.close()
+
+# -------------------------
+# METRICAS GLOBALES
+# -------------------------
+plt.figure(figsize=(12,6), dpi=150)
+for metric in ["precision","recall","mAP50","mAP95"]:
+    plt.plot(metrics_history_global[metric], label=metric, marker='o')
+plt.title("Métricas Globales a lo largo de las Épocas", fontsize=16)
+plt.xlabel("Época", fontsize=14)
+plt.ylabel("Valor", fontsize=14)
+plt.ylim(0,1)
+plt.legend(fontsize=12)
+plt.grid(True)
+plt.savefig(output_dir / "metrics_global_progress.png")
+plt.close()
+
+# -------------------------
+# TABLA DE METRICAS POR CLASE (última época)
+# -------------------------
+df_metrics_class = pd.DataFrame({
+    cls:{metric:metrics_history_per_class[cls][metric][-1] for metric in ["precision","recall","mAP50","mAP95"]}
+    for cls in range(1,num_classes_plot+1)
+}).T
+
+plt.figure(figsize=(12,6), dpi=200)
+plt.axis('off')
+plt.table(
+    cellText=df_metrics_class.values,
+    colLabels=df_metrics_class.columns,
+    rowLabels=[f"Clase {c}" for c in df_metrics_class.index],
+    loc='center',
+    cellLoc='center'
+)
+plt.title("Métricas por Clase (última época)", fontsize=16)
+plt.savefig(output_dir / "metrics_table_per_class.png")
+plt.close()
+
+# -------------------------
+# TABLA DE METRICAS GLOBALES (última época)
+# -------------------------
+df_metrics_global = pd.DataFrame({
+    metric: metrics_history_global[metric][-1] for metric in ["precision","recall","mAP50","mAP95"]
+}, index=["Global"])
+
+plt.figure(figsize=(10,4), dpi=200)
+plt.axis('off')
+plt.table(
+    cellText=df_metrics_global.values,
+    colLabels=df_metrics_global.columns,
+    rowLabels=df_metrics_global.index,
+    loc='center',
+    cellLoc='center'
+)
+plt.title("Métricas Globales (última época)", fontsize=16)
+plt.savefig(output_dir / "metrics_table_global.png")
+plt.close()
+
+# -------------------------
+# MATRIZ DE CONFUSIÓN GLOBAL
+# -------------------------
+plt.figure(figsize=(8,6), dpi=150)
+sns.heatmap(cm.cpu(), annot=True, fmt='d', cmap="Blues",
+            xticklabels=[f"C{c}" for c in range(1,num_classes_plot+1)],
+            yticklabels=[f"C{c}" for c in range(1,num_classes_plot+1)])
+plt.xlabel("Predicho", fontsize=14)
+plt.ylabel("Verdadero", fontsize=14)
+plt.title("Matriz de Confusión Global", fontsize=16)
+plt.savefig(output_dir / "confusion_matrix_global.png")
+plt.close()
+
