@@ -1,0 +1,36 @@
+# Ignorar datasets completos
+Data/
+
+# Evitar imágenes pesadas en cualquier parte del repo
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+
+# Evitar anotaciones pesadas
+*.xml
+*.json
+*.txt
+
+# Evitar archivos comprimidos de datasets
+*.zip
+*.rar
+*.tar
+*.gz
+
+# Evitar checkpoints y modelos pesados
+*.pt
+*.pth
+
+# Carpetas de resultados de YOLO
+runs/
+outputs/
+Resultados/
+
+# Archivos temporales de Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
