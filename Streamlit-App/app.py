@@ -5,28 +5,24 @@ import numpy as np
 import tempfile
 import os
 
-# -----------------------------
-# CONFIGURACIÓN DE LA APP
-# -----------------------------
+
+# Configuración de la app
 st.set_page_config(page_title="Detección de Fachadas", layout="centered")
 
 st.title("🏛️ Detección de elementos en Fachadas")
 st.subheader("Detección de Puertas, Ventanas, Balcones y Barandas")
 st.write("Sube una imagen y el modelo YOLO detectará los elementos arquitectónicos.")
 
-# -----------------------------
-# CARGAR MODELO
-# -----------------------------
+
+# Cargar el modelo
 @st.cache_resource
 def load_model():
-    model = YOLO("best.pt")  # Asegúrate de tener best.pt en la misma carpeta
+    model = YOLO("D:/Documentos/3RO/1ER Semestre/RN/Object-detection/YOLOV8/Resultados Yolo/yolo_final/weights/best.pt")  # Asegúrate de tener best.pt en la misma carpeta
     return model
 
 model = load_model()
 
-# -----------------------------
-# AJUSTES DE USUARIO
-# -----------------------------
+
 conf_threshold = st.slider(
     "Umbral de confianza", 
     min_value=0.1, 
@@ -35,9 +31,8 @@ conf_threshold = st.slider(
     step=0.05
 )
 
-# -----------------------------
-# SUBIR IMAGEN
-# -----------------------------
+
+# Subir imagen
 uploaded_file = st.file_uploader("Sube una imagen", type=["jpg", "png"])
 
 if uploaded_file is not None:
@@ -50,9 +45,8 @@ if uploaded_file is not None:
         tmp_path = tmp.name
         image.save(tmp_path)
 
-    # -----------------------------
-    # EJECUTAR YOLO
-    # -----------------------------
+    
+    # Ejecutar yolo
     st.subheader("Detecciones")
     results = model.predict(tmp_path, conf=conf_threshold)
 
@@ -60,9 +54,8 @@ if uploaded_file is not None:
     result_img = results[0].plot()  # Imagen con cajas dibujadas
     st.image(result_img, caption="Resultado YOLO", use_column_width=True)
 
-    # -----------------------------
-    # MOSTRAR DETALLES DE DETECCIÓN
-    # -----------------------------
+    
+    # Mostrar detalles por clases
     st.subheader("📊 Conteo por clase")
 
     names = model.names
