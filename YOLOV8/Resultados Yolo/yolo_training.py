@@ -23,7 +23,7 @@ BEST_BATCH = 8
 DATA_YAML = r"E:\Escuela\Redes Neuronales\Angelica\Data\data.yaml"
 MODEL_WEIGHTS = "yolov8l.pt"
 
-EPOCHS = 50          
+EPOCHS = 10          
 IMGSZ = 640
 WORKERS = 8
 
