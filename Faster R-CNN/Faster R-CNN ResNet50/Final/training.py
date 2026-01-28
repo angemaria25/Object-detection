@@ -13,9 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
-# ==========================================
-# DATASET DE TENSORES PRE-GUARDADOS (.PT)
-# ==========================================
+# Dataset de tensores pre-guardados (.pt)
 class PreloadedPTDataset(Dataset):
     def __init__(self, img_pt_dir, lbl_dir, img_size=800):
         self.img_pt_dir = Path(img_pt_dir)
@@ -56,24 +54,18 @@ class PreloadedPTDataset(Dataset):
             return torch.zeros((0,4)), torch.zeros((0,), dtype=torch.int64)
         return torch.tensor(boxes,dtype=torch.float32), torch.tensor(labels,dtype=torch.int64)
 
-# ==========================================
-# COLLATE
-# ==========================================
+# Collate
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-# ==========================================
-# MODELO
-# ==========================================
+# Modelo
 def get_model(num_classes):
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features,num_classes)
     return model
 
-# ==========================================
-# CONGELAR PARCIAL BACKBONE
-# ==========================================
+# Congelar parcialmente el backbone
 def freeze_backbone_partially(model):
     backbone = model.backbone.body
     for name,param in backbone.named_parameters():
@@ -136,9 +128,7 @@ def validate_model(model, val_loader, device, num_classes_plot):
                     if len(preds_cls) > 0:
                         preds_per_class[cls].append((scores_cls, preds_cls))
 
-    # -------------------------------------------------------
     # Cálculo de métricas por clase
-    # -------------------------------------------------------
     cls_metrics = {}
     for cls in range(1, num_classes_plot + 1):
         if len(preds_per_class[cls]) == 0 and len(gts_per_class[cls]) == 0:
@@ -201,20 +191,14 @@ def validate_model(model, val_loader, device, num_classes_plot):
             "mAP95": mAP95
         }
 
-    # -------------------------------------------------------
     # Métricas globales
-    # -------------------------------------------------------
     global_metrics = {metric: sum(cls_metrics[c][metric] for c in cls_metrics)/num_classes_plot 
-                      for metric in ["precision","recall","mAP50","mAP95"]}
+                        for metric in ["precision","recall","mAP50","mAP95"]}
 
     return cls_metrics, global_metrics, cm
 
 
-
-
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
+# Main
 if __name__ == "__main__":
 
     TRAIN_IMG = r"E:\Escuela\Redes Neuronales\Angelica\Data\train\images_pt"
@@ -261,13 +245,10 @@ if __name__ == "__main__":
         metrics_history_global = checkpoint.get('metrics_history_global',metrics_history_global)
         print(f"Resumed from epoch {start_epoch}")
 
-    # =========================
-    # LOOP ENTRENAMIENTO + VALIDACIÓN
-    # ==========================
+
+    # Loop Train + Validación
     for epoch in range(start_epoch,num_epochs):
-        # -------------------------
-        # TRAINING
-        # -------------------------
+        # Training
         model.train()
         total_train_loss = 0.0
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]") as pbar:
@@ -288,9 +269,7 @@ if __name__ == "__main__":
         train_losses.append(total_train_loss/len(train_loader))
         torch.cuda.synchronize()
 
-        # -------------------------
-        # VALIDACIÓN
-        # -------------------------
+        # Validación
         cls_metrics, global_metrics, cm = validate_model(model, val_loader, device, num_classes_plot)
 
         # Guardar métricas
@@ -300,9 +279,7 @@ if __name__ == "__main__":
         for metric in ["precision","recall","mAP50","mAP95"]:
             metrics_history_global[metric].append(global_metrics[metric])
 
-        # -------------------------
         # CHECKPOINT
-        # -------------------------
         scheduler.step()
         checkpoint = {
             'epoch': epoch,
@@ -318,13 +295,10 @@ if __name__ == "__main__":
         print(f"Epoch {epoch+1} | Train Loss: {train_losses[-1]:.4f} | mAP50 Global: {global_metrics['mAP50']:.4f}")
 
 
-# =========================
-# GRAFICOS Y TABLAS FINALES
-# ==========================
 
-# -------------------------
-# LOSS POR ÉPOCA
-# -------------------------
+# Gráficos y tablas finales
+
+# Loss por época
 plt.figure(figsize=(12,6), dpi=150)
 plt.plot(train_losses, label="Train Loss", marker='o')
 plt.title("Evolución del Train Loss por Época", fontsize=16)
@@ -335,9 +309,8 @@ plt.grid(True)
 plt.savefig(output_dir / "train_loss_per_epoch.png")
 plt.close()
 
-# -------------------------
-# METRICAS POR CLASE
-# -------------------------
+
+# Métricas por clase
 for metric in ["precision","recall","mAP50","mAP95"]:
     plt.figure(figsize=(12,6), dpi=150)
     for cls in range(1,num_classes_plot+1):
@@ -351,9 +324,8 @@ for metric in ["precision","recall","mAP50","mAP95"]:
     plt.savefig(output_dir / f"{metric}_per_class_progress.png")
     plt.close()
 
-# -------------------------
-# METRICAS GLOBALES
-# -------------------------
+
+# Métricas globales
 plt.figure(figsize=(12,6), dpi=150)
 for metric in ["precision","recall","mAP50","mAP95"]:
     plt.plot(metrics_history_global[metric], label=metric, marker='o')
@@ -366,9 +338,8 @@ plt.grid(True)
 plt.savefig(output_dir / "metrics_global_progress.png")
 plt.close()
 
-# -------------------------
-# TABLA DE METRICAS POR CLASE (última época)
-# -------------------------
+
+# Tabla de métricas por clase (última época)
 df_metrics_class = pd.DataFrame({
     cls:{metric:metrics_history_per_class[cls][metric][-1] for metric in ["precision","recall","mAP50","mAP95"]}
     for cls in range(1,num_classes_plot+1)
@@ -387,9 +358,7 @@ plt.title("Métricas por Clase (última época)", fontsize=16)
 plt.savefig(output_dir / "metrics_table_per_class.png")
 plt.close()
 
-# -------------------------
-# TABLA DE METRICAS GLOBALES (última época)
-# -------------------------
+# Tabla de métricas globales (última época)
 df_metrics_global = pd.DataFrame({
     metric: metrics_history_global[metric][-1] for metric in ["precision","recall","mAP50","mAP95"]
 }, index=["Global"])
@@ -407,9 +376,8 @@ plt.title("Métricas Globales (última época)", fontsize=16)
 plt.savefig(output_dir / "metrics_table_global.png")
 plt.close()
 
-# -------------------------
-# MATRIZ DE CONFUSIÓN GLOBAL
-# -------------------------
+
+# Matriz de confusión global
 plt.figure(figsize=(8,6), dpi=150)
 sns.heatmap(cm.cpu(), annot=True, fmt='d', cmap="Blues",
             xticklabels=[f"C{c}" for c in range(1,num_classes_plot+1)],

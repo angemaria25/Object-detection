@@ -10,9 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ==========================================
-# DATASET DE TENSORES PRE-GUARDADOS (.PT)
-# ==========================================
+# Dataset de tensores pre-guardados (.pt)
 class PreloadedPTDataset(Dataset):
     def __init__(self, img_pt_dir, lbl_dir, img_size=800):
         self.img_pt_dir = Path(img_pt_dir)
@@ -53,15 +51,11 @@ class PreloadedPTDataset(Dataset):
             return torch.zeros((0,4)), torch.zeros((0,), dtype=torch.int64)
         return torch.tensor(boxes,dtype=torch.float32), torch.tensor(labels,dtype=torch.int64)
 
-# ==========================================
-# COLLATE
-# ==========================================
+# Collate
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-# ==========================================
-# MODELO
-# ==========================================
+# Modelo
 def get_model(num_classes):
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -124,9 +118,8 @@ def validate_model(model, test_loader, device, num_classes_plot):
                     if len(preds_cls) > 0:
                         preds_per_class[cls].append((scores_cls, preds_cls))
 
-    # -------------------------------------------------------
+    
     # Cálculo de métricas por clase
-    # -------------------------------------------------------
     cls_metrics = {}
     for cls in range(1, num_classes_plot + 1):
         if len(preds_per_class[cls]) == 0 and len(gts_per_class[cls]) == 0:
@@ -189,17 +182,15 @@ def validate_model(model, test_loader, device, num_classes_plot):
             "mAP95": mAP95
         }
 
-    # -------------------------------------------------------
+
     # Métricas globales
-    # -------------------------------------------------------
     global_metrics = {metric: sum(cls_metrics[c][metric] for c in cls_metrics)/num_classes_plot 
-                      for metric in ["precision","recall","mAP50","mAP95"]}
+                        for metric in ["precision","recall","mAP50","mAP95"]}
 
     return cls_metrics, global_metrics, cm
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
+
+# Main
 if __name__ == "__main__":
 
     TEST_IMG = r"E:\Escuela\Redes Neuronales\Angelica\Data\test\images_pt"
@@ -235,9 +226,8 @@ if __name__ == "__main__":
         checkpoint_dir = output_dir / f"epoch_{epoch}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # ------------------------- 
-        # TABLA DE METRICAS POR CLASE
-        # -------------------------
+        
+        # Tabla de métricas por clase
         df_metrics_class = pd.DataFrame({
             cls: {metric: cls_metrics[cls][metric] for metric in ["precision","recall","mAP50","mAP95"]}
             for cls in range(1, num_classes_plot + 1)
@@ -256,9 +246,7 @@ if __name__ == "__main__":
         plt.savefig(checkpoint_dir / "metrics_table_per_class.png")
         plt.close()
 
-        # ------------------------- 
-        # TABLA DE METRICAS GLOBALES
-        # -------------------------
+        # Tabla de métricas globales
         df_metrics_global = pd.DataFrame({
             metric: global_metrics[metric] for metric in ["precision","recall","mAP50","mAP95"]
         }, index=["Global"])
@@ -276,9 +264,8 @@ if __name__ == "__main__":
         plt.savefig(checkpoint_dir / "metrics_table_global.png")
         plt.close()
 
-        # ------------------------- 
-        # MATRIZ DE CONFUSIÓN GLOBAL
-        # -------------------------
+        
+        # Matriz de confusión global
         plt.figure(figsize=(8,6), dpi=150)
         sns.heatmap(cm.cpu(), annot=True, fmt='d', cmap="Blues",
                     xticklabels=[f"C{c}" for c in range(1,num_classes_plot+1)],
