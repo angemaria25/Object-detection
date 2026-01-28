@@ -23,6 +23,7 @@ Data/
 # Evitar checkpoints y modelos pesados
 *.pt
 *.pth
+*.pt
 
 # Carpetas de resultados de YOLO
 runs/
